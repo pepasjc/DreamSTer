@@ -4065,7 +4065,8 @@ def launch(game, overclock, cfg=None):
 #                       game's own file for keys the game overrides, else
 #                       globally
 #   request.json        emulator -> launcher, on exit: {"action": "load",
-#                       "path": P} launches P right away, {"action": "exit"}
+#                       "path": P} launches P right away, {"action": "list"}
+#                       (in-game Exit Game) returns to the game list, {"action": "exit"}
 #                       leaves DreamSTer; none = back to the game list
 # Written atomically (temp file + rename); stale emulator files are removed
 # before each launch.
@@ -4235,6 +4236,8 @@ def take_request():
     if not isinstance(data, dict):
         return None
     action = data.get("action")
+    if action == "list":             # in-game "Exit Game": back to the list
+        return None
     if action == "exit":
         return ("exit",)
     if action == "load":
