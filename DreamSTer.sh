@@ -13,8 +13,10 @@ a screen is always an explicit Back/Exit menu entry.
 
 import configparser
 import curses
+import errno
 import fcntl
 import glob
+import json
 import mmap
 import os
 import re
@@ -74,6 +76,17 @@ if os.path.exists(os.path.join(MINICAST_DIR, "minicast-crt-r7.elf")):
     MINICAST_ELF = os.path.join(MINICAST_DIR, "minicast-crt-r7.elf")
 MISTER_BIN = "/media/fat/MiSTer"
 MENU_RBF = "/media/fat/menu.rbf"
+
+# Pixel UI (minicast/dsui.py): the menus drawn on the Linux framebuffer in
+# the look of the emulator's own in-game lists. Without it (module missing,
+# no framebuffer, not on the console, DREAMSTER_UI=curses) the plain curses
+# UI is used.
+if MINICAST_DIR not in sys.path:
+    sys.path.append(MINICAST_DIR)
+try:
+    import dsui
+except ImportError:
+    dsui = None
 
 GAME_EXTS = (".cdi", ".cue", ".gdi")
 
@@ -439,6 +452,13 @@ RA_OPT = Option("RetroAchievements", "CrtRetroAchievements",
                 [("dryrun", "On, dry run (nothing submitted)"),
                  ("on", "On (softcore)"), ("off", "Off")],
                 "dryrun", section="dreamster")
+# Unlock popups: "auto" leaves it to retroachievements.cfg (dreamster_popups,
+# default on); On/Off are passed as MINICAST_RA_POPUPS. Also what the
+# emulator's in-game menu changes (options_changed.json).
+RA_POPUPS_OPT = Option("Achievement popups", "CrtRaPopups",
+                       [("auto", "As retroachievements.cfg"), ("on", "On"),
+                        ("off", "Off")],
+                       "auto", section="dreamster")
 VMU_OPT = Option("VMU saves", "CrtVmuPerGame",
                  [("game", "Per game (GameSync)"), ("shared", "Shared (one VMU)")],
                  "game", section="dreamster")
@@ -464,7 +484,7 @@ CRT_CLOCK_OPT = Option("CRT Clock (r7)", "CrtClockSelR7",
 ALL_OPTIONS = [REGION_OPT, CABLE_OPT, OVERCLOCK_OPT, TIMEREC_OPT, AUDIO_OPT,
                FPS_OPT, AUTORESET_OPT, CLOCK_OPT, DUMP_OPT,
                CRT_VOL_OPT, VIDEO_OPT, ANALOG_OPT, FIELD_OPT, VFILTER_OPT, WIFI_OPT,
-               VMU_OPT, RA_OPT,
+               VMU_OPT, RA_OPT, RA_POPUPS_OPT,
                CRT_CLOCK_OPT,
                CRT_EMU_OPT] + OPT_ITEMS \
               + [OPTMODE_OPT]
@@ -895,6 +915,28 @@ def wait_for_external_game_dir(
         if remaining <= 0:
             return None
         sleep_func(min(poll_interval, remaining))
+
+
+def display_names(games):
+    """List names for scan_games() entries: no extension, and no folder
+    when it only repeats the file name ('Crazy Taxi (USA)/Crazy Taxi
+    (USA).gdi' -> 'Crazy Taxi (USA)'). Names that would then collide keep
+    their full relative path."""
+    names = []
+    for label, _ in games:
+        stem = label
+        base = os.path.basename(label)
+        if "." in base:
+            stem = label[:len(label) - len(base)] + base.rsplit(".", 1)[0]
+        d, b = os.path.split(stem)
+        if d and b.startswith(os.path.basename(d)):
+            stem = os.path.join(os.path.dirname(d), b)
+        names.append(stem)
+    counts = {}
+    for n in names:
+        counts[n] = counts.get(n, 0) + 1
+    return [n if counts[n] == 1 else label
+            for n, (label, _) in zip(names, games)]
 
 
 def scan_games(game_dirs):
@@ -1818,9 +1860,9 @@ def test_screen(scr, devices, subtitle):
 
             draw_title(scr, subtitle)
             h, _ = scr.getmaxyx()
-            safe_addstr(scr, 3, 2, "> Back", color(C_SEL, curses.A_BOLD))
+            draw_item(scr, 3, 4, "Back", True, bar=False)
             list_top = 5
-            list_h = max(1, h - list_top - 2)
+            list_h = max(1, h - list_top - (1 if is_pixel(scr) else 2))
             total = sum(3 if not states[fd].cfg else 4 for fd in fds)
             top = max(0, min(top, max(0, total - list_h)))
 
@@ -1862,9 +1904,8 @@ def test_screen(scr, devices, subtitle):
                        st.trig["trig_l"], st.trig["trig_r"]),
                     color(C_VALUE))
                 yv += 2
-            safe_addstr(scr, h - 1, 1,
-                        "Press buttons / move axes   UP/DOWN: scroll   "
-                        "ENTER/A: back", color(C_DIM))
+            draw_footer(scr, "Press buttons / move axes   Up/Down: scroll   "
+                        "A/Enter: back")
             scr.refresh()
     finally:
         scr.nodelay(False)
@@ -1893,8 +1934,8 @@ def device_list_screen(scr, devices, cfg):
     while True:
         draw_title(scr, "%d input device(s)" % len(devices))
         h, w = scr.getmaxyx()
-        list_top = 4
-        list_h = max(1, h - list_top - 3)
+        list_top, list_h = list_geom(scr, 4, 3)
+        px = is_pixel(scr)
 
         cur = selectable[sel]
         if cur < top:
@@ -1907,29 +1948,34 @@ def device_list_screen(scr, devices, cfg):
             kind, payload = rows[i]
             y = list_top + (i - top)
             if kind == "header":
-                safe_addstr(scr, y, 2, "[ %s ]" % payload,
-                            color(C_HEADER, curses.A_BOLD))
+                draw_header(scr, y, payload)
                 continue
             if kind == "back":
                 text = "Back"
             elif kind == "test":
                 text = "Test (all devices)"
+            elif px:
+                # name, then kind + port on the right; the id is on the
+                # device's own page
+                active = (PORT_NAMES[device_port(payload.id)]
+                          if effective_config(payload) else "inactive")
+                right = "%-8s %s" % (payload.kind, active)
+                text = fit(payload.name, max(8, w - PX_ITEM_X - len(right) - 2))
+                draw_value(scr, y, 0, right, i == cur,
+                           attr=color(C_VALUE) if effective_config(payload)
+                           else color(C_DIM))
             else:
                 active = ("[Active: %s]" % PORT_NAMES[device_port(payload.id)]
                           if effective_config(payload) else "")
                 text = "%-32s %-10s %s  %s" % (payload.name[:32],
                                                payload.kind,
                                                "[%s]" % payload.id, active)
-            if i == cur:
-                safe_addstr(scr, y, 1, " " * (w - 3), color(C_SEL))
-                safe_addstr(scr, y, 2, "> " + text, color(C_SEL, curses.A_BOLD))
-            else:
-                safe_addstr(scr, y, 4, text)
+            draw_item(scr, y, 4, text, i == cur)
 
         if notice:
             safe_addstr(scr, h - 2, 1, notice, notice_attr)
-        footer = "UP/DOWN: select   ENTER/A: open   (changes save automatically)"
-        safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
+        draw_footer(scr, "Up/Down: select   A/Enter: open   "
+                    "(changes save automatically)")
         scr.refresh()
 
         ch = nav_getch(scr)
@@ -1961,11 +2007,12 @@ def device_screen(scr, dev, cfg, devices):
         nonlocal top
         draw_title(scr, dev.name)
         h, w = scr.getmaxyx()
-        safe_addstr(scr, 3, 2, "ID:   %s" % dev.id, color(C_DIM))
-        safe_addstr(scr, 4, 2, "Path: %s  (%s)" % (dev.path, dev.kind),
+        ix = 0 if is_pixel(scr) else 2
+        safe_addstr(scr, 3, ix, "ID:   %s" % dev.id, color(C_DIM))
+        safe_addstr(scr, 4, ix, "Path: %s  (%s)" % (dev.path, dev.kind),
                     color(C_DIM))
-        list_top = 6
-        list_h = max(1, h - list_top - 2)
+        # (pixel: the list starts right under the two info lines)
+        list_top, list_h = list_geom(scr, 6)
         cur = selectable[sel]
         if cur < top:
             top = cur
@@ -1979,8 +2026,7 @@ def device_screen(scr, dev, cfg, devices):
             is_sel = (selectable[sel] == i)
             if row[0] == "header":
                 if row[1]:
-                    safe_addstr(scr, y, 2, "[ %s ]" % row[1],
-                                color(C_HEADER, curses.A_BOLD))
+                    draw_header(scr, y, row[1])
                 continue
             if row[0] == "back":
                 text = "Back"
@@ -1999,16 +2045,11 @@ def device_screen(scr, dev, cfg, devices):
                 value = mapping_text(mappings.get(row[1]))
                 if i == capture_idx:
                     value = capture_text
-            if is_sel:
-                safe_addstr(scr, y, 1, " " * (w - 3), color(C_SEL))
-                safe_addstr(scr, y, 2, "> " + text, color(C_SEL, curses.A_BOLD))
-                safe_addstr(scr, y, 6 + len(text) + 2, value,
-                            color(C_SEL, curses.A_BOLD))
-            else:
-                safe_addstr(scr, y, 4, text)
-                safe_addstr(scr, y, 6 + len(text) + 2, value, color(C_VALUE))
-        footer = "UP/DOWN: select   ENTER/A: map/activate   LEFT/RIGHT: port"
-        safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
+            draw_item(scr, y, 4, text, is_sel)
+            if value:
+                draw_value(scr, y, 6 + len(text) + 2, value, is_sel)
+        draw_footer(scr, "Up/Down: select   A/Enter: map/activate   "
+                    "Left/Right: port")
 
     while True:
         draw()
@@ -2114,18 +2155,40 @@ def init_colors():
     curses.init_pair(C_VALUE, curses.COLOR_GREEN, -1)
 
 
+# True while the menus draw on the framebuffer (dsui.FbWindow): attributes
+# are then plain (pair << 8) | flags - curses' own COLOR_PAIR() encoding -
+# which the pixel window maps to the theme colours (fb_styles()).
+PIXEL = [False]
+
+
 def color(pair, extra=0):
+    if PIXEL[0]:
+        return (pair << 8) | extra
     if curses.has_colors():
         return curses.color_pair(pair) | extra
     return extra
+
+
+def fb_styles():
+    """Colour pair -> (fg, bg) of the pixel UI (ra_osd's palette)."""
+    return {0: (dsui.TEXT, None), C_TITLE: (dsui.GOLD, None),
+            C_ERROR: (dsui.RED, None), C_SEL: (dsui.TEXT, dsui.HILITE),
+            C_HEADER: (dsui.GOLD, None), C_DIM: (dsui.DIM, None),
+            C_VALUE: (dsui.BLUE, None)}
+
+
+def is_pixel(scr):
+    return getattr(scr, "is_pixel", False)
 
 
 def safe_addstr(scr, y, x, text, attr=0):
     h, w = scr.getmaxyx()
     if y < 0 or y >= h or x >= w:
         return
+    # curses can't write the bottom-right cell; the pixel grid can
+    room = w - x if is_pixel(scr) else w - x - 1
     try:
-        scr.addstr(y, x, text[: max(0, w - x - 1)], attr)
+        scr.addstr(y, x, text[: max(0, room)], attr)
     except curses.error:
         pass
 
@@ -2133,12 +2196,111 @@ def safe_addstr(scr, y, x, text, attr=0):
 def draw_title(scr, subtitle=""):
     _, w = scr.getmaxyx()
     scr.erase()
+    if is_pixel(scr):
+        # like the emulator's lists: gold title, the context line under it,
+        # a thin rule (grid row 2) - all left-aligned
+        safe_addstr(scr, 0, 0, TITLE, color(C_TITLE))
+        if subtitle:
+            safe_addstr(scr, 1, 0, subtitle)
+        return
     safe_addstr(scr, 0, max(0, (w - len(TITLE)) // 2), TITLE,
                 color(C_TITLE, curses.A_BOLD))
     if subtitle:
         safe_addstr(scr, 1, max(0, (w - len(subtitle)) // 2), subtitle,
                     color(C_DIM))
     safe_addstr(scr, 2, 0, "-" * (w - 1), color(C_DIM))
+
+
+# Row helpers shared by the screens. curses keeps its original look ("> "
+# marker, reversed text); the pixel UI uses a full-width highlight bar,
+# items indented under gold section names and right-aligned values.
+PX_ITEM_X = 2
+
+
+def fit(text, n):
+    """At most n chars; longer text ends in '...' (ra_osd's ra_fit)."""
+    if len(text) <= n:
+        return text
+    return text[:max(0, n - 3)] + "..." if n >= 3 else text[:max(0, n)]
+
+
+def sel_bar(scr, y):
+    if is_pixel(scr):
+        scr.bar(y)
+    else:
+        _, w = scr.getmaxyx()
+        safe_addstr(scr, y, 1, " " * (w - 3), color(C_SEL))
+
+
+def draw_item(scr, y, x, text, selected, attr=0, bar=True):
+    """A menu entry; x = its curses column when not selected."""
+    if is_pixel(scr):
+        if selected:
+            scr.bar(y)
+        _, w = scr.getmaxyx()
+        safe_addstr(scr, y, PX_ITEM_X, fit(text.rstrip(), w - PX_ITEM_X),
+                    color(C_SEL) if selected else attr)
+        return
+    if selected:
+        if bar:
+            sel_bar(scr, y)
+        safe_addstr(scr, y, x - 2, "> " + text, color(C_SEL, curses.A_BOLD))
+    else:
+        safe_addstr(scr, y, x, text, attr)
+
+
+def draw_value(scr, y, x, text, selected, attr=None, right=0):
+    """A setting's value: at column x in curses, right-aligned (leaving
+    `right` columns free) in the pixel UI."""
+    if attr is None:
+        attr = color(C_VALUE)
+    if is_pixel(scr):
+        _, w = scr.getmaxyx()
+        safe_addstr(scr, y, max(0, w - right - len(text)), text,
+                    color(C_SEL) if selected else attr)
+    else:
+        safe_addstr(scr, y, x, text,
+                    color(C_SEL, curses.A_BOLD) if selected else attr)
+
+
+def draw_header(scr, y, text):
+    if is_pixel(scr):
+        safe_addstr(scr, y, 0, text, color(C_HEADER))
+    else:
+        safe_addstr(scr, y, 2, "[ %s ]" % text, color(C_HEADER, curses.A_BOLD))
+
+
+def draw_footer(scr, text, pos=""):
+    """Help line; pos (pixel UI only) goes right-aligned, e.g. '12/140'."""
+    h, w = scr.getmaxyx()
+    if is_pixel(scr):
+        if pos and len(text) + len(pos) + 1 > w:
+            text = text[:max(0, w - len(pos) - 4)] + "..."
+        safe_addstr(scr, h - 1, 0, text, color(C_DIM))
+        if pos:
+            safe_addstr(scr, h - 1, w - len(pos), pos, color(C_DIM))
+    else:
+        safe_addstr(scr, h - 1, 1, text, color(C_DIM))
+
+
+def list_geom(scr, top, gap=2):
+    """(first row, rows) of a screen's list. The pixel grid has the title
+    rule on row 2 instead of a text row of dashes, and its own rule above
+    the help line, so lists start a row higher and end a row lower."""
+    h, _ = scr.getmaxyx()
+    if is_pixel(scr):
+        top, gap = top - 1, gap - 1
+    return top, max(1, h - top - gap)
+
+
+def scroll_pos(top, visible, total, index=None, count=None):
+    """ra_osd-style position: up/down arrows while there is more above or
+    below, then 'n/N'."""
+    arrows = (u"\u25b2" if top > 0 else " ") + \
+             (u"\u25bc" if top + visible < total else " ")
+    if index is None:
+        return arrows.strip() and arrows
+    return "%s %d/%d" % (arrows, index, count)
 
 
 def error_screen(scr, lines):
@@ -2164,7 +2326,8 @@ def main_menu_screen(scr, games, game_dirs):
             ("bios", None),
             ("exit", None),
             ("header", "Disc Images")]
-    rows += [("game", g) for g in games]
+    rows += [("game", (name, path))
+             for name, (_, path) in zip(display_names(games), games)]
     selectable = [i for i, r in enumerate(rows) if r[0] != "header"]
     # default to the first disc image if any, otherwise Boot To Bios
     sel = 3 if games else 1
@@ -2173,9 +2336,7 @@ def main_menu_screen(scr, games, game_dirs):
         source = (game_dirs[0] if len(game_dirs) == 1
                   else "%d folders" % len(game_dirs))
         draw_title(scr, "%d game(s) found in %s" % (len(games), source))
-        h, w = scr.getmaxyx()
-        list_top = 4
-        list_h = max(1, h - list_top - 2)
+        list_top, list_h = list_geom(scr, 4)
 
         cur = selectable[sel]
         if cur < top:
@@ -2188,8 +2349,7 @@ def main_menu_screen(scr, games, game_dirs):
             kind, payload = rows[i]
             y = list_top + (i - top)
             if kind == "header":
-                safe_addstr(scr, y, 2, "[ %s ]" % payload,
-                            color(C_HEADER, curses.A_BOLD))
+                draw_header(scr, y, payload)
                 continue
             if kind == "configure":
                 text = "Configure"
@@ -2199,14 +2359,15 @@ def main_menu_screen(scr, games, game_dirs):
                 text = "Exit To MiSTer"
             else:
                 text = payload[0]
-            if i == cur:
-                safe_addstr(scr, y, 1, " " * (w - 3), color(C_SEL))
-                safe_addstr(scr, y, 2, "> " + text, color(C_SEL, curses.A_BOLD))
-            else:
-                safe_addstr(scr, y, 4, text)
+            draw_item(scr, y, 4, text, i == cur)
 
-        footer = "UP/DOWN: select   ENTER/A: select"
-        safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
+        pos = ""
+        if rows[cur][0] == "game":
+            pos = scroll_pos(top, list_h, len(rows), cur - 4, len(games))
+        else:
+            pos = scroll_pos(top, list_h, len(rows))
+        draw_footer(scr, "Up/Down: select   Left/Right: page   A/Enter: open",
+                    pos)
         scr.refresh()
 
         ch = nav_getch(scr)
@@ -2214,6 +2375,13 @@ def main_menu_screen(scr, games, game_dirs):
             sel = (sel - 1) % len(selectable)
         elif ch == curses.KEY_DOWN:
             sel = (sel + 1) % len(selectable)
+        elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            # a page at a time, stopping at the ends (no wrap-around)
+            step = list_h if ch == curses.KEY_RIGHT else -list_h
+            target = max(0, min(len(rows) - 1, cur + step))
+            sel = min(range(len(selectable)),
+                      key=lambda s: abs(selectable[s] - target))
+            top += step
         elif ch in KEY_ENTER:
             kind, payload = rows[selectable[sel]]
             if kind == "game":
@@ -2243,16 +2411,23 @@ def confirm_screen(scr, lines, subtitle="Are you sure?", yes="Yes", no="No"):
                         curses.A_BOLD if i == 0 else 0)
         yb = min(h - 3, y + len(lines) + 2)
         labels = ("  %s  " % yes, "  %s  " % no)
-        x = max(0, w // 2 - 14)
-        for i, lab in enumerate(labels):
-            if i == sel:
-                safe_addstr(scr, yb, x, "> " + lab,
-                            color(C_SEL, curses.A_BOLD))
-            else:
-                safe_addstr(scr, yb, x, "  " + lab)
-            x += len(lab) + 8
-        safe_addstr(scr, h - 1, 1, "LEFT/RIGHT: select   ENTER/A: confirm",
-                    color(C_DIM))
+        if is_pixel(scr):
+            # two buttons, the selected one on the highlight colour
+            x = max(0, (w - len(labels[0]) - len(labels[1]) - 6) // 2)
+            for i, lab in enumerate(labels):
+                safe_addstr(scr, yb, x, lab,
+                            color(C_SEL) if i == sel else color(C_DIM))
+                x += len(lab) + 6
+        else:
+            x = max(0, w // 2 - 14)
+            for i, lab in enumerate(labels):
+                if i == sel:
+                    safe_addstr(scr, yb, x, "> " + lab,
+                                color(C_SEL, curses.A_BOLD))
+                else:
+                    safe_addstr(scr, yb, x, "  " + lab)
+                x += len(lab) + 8
+        draw_footer(scr, "Left/Right: select   A/Enter: confirm")
         scr.refresh()
         ch = nav_getch(scr)
         if ch in (curses.KEY_LEFT, curses.KEY_RIGHT,
@@ -2309,14 +2484,12 @@ def peripherals_screen(scr, cfg):
     sel = 0
     while True:
         draw_title(scr, "Dreamcast Peripherals")
-        h, w = scr.getmaxyx()
-        list_top = 4
+        list_top, _ = list_geom(scr, 4)
         for i, row in enumerate(rows):
             y = list_top + i
             is_sel = (selectable[sel] == i)
             if row[0] == "header":
-                safe_addstr(scr, y, 2, "[ %s ]" % row[1],
-                            color(C_HEADER, curses.A_BOLD))
+                draw_header(scr, y, row[1])
                 continue
             if row[0] == "back":
                 text = "Back"
@@ -2326,16 +2499,10 @@ def peripherals_screen(scr, cfg):
                 text = "%-26s" % PORT_NAMES[port]
                 pid = get_port_peripheral(cfg, port)
                 value = "< %s >" % PERIPHERAL_LABELS.get(pid, "Custom")
-            if is_sel:
-                safe_addstr(scr, y, 1, " " * (w - 3), color(C_SEL))
-                safe_addstr(scr, y, 2, "> " + text, color(C_SEL, curses.A_BOLD))
-                safe_addstr(scr, y, 6 + len(text) + 2, value,
-                            color(C_SEL, curses.A_BOLD))
-            else:
-                safe_addstr(scr, y, 4, text)
-                safe_addstr(scr, y, 6 + len(text) + 2, value, color(C_VALUE))
-        footer = "UP/DOWN: select   LEFT/RIGHT/ENTER/A: change"
-        safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
+            draw_item(scr, y, 4, text, is_sel)
+            if value:
+                draw_value(scr, y, 6 + len(text) + 2, value, is_sel)
+        draw_footer(scr, "Up/Down: select   Left/Right/A: change")
         scr.refresh()
 
         ch = nav_getch(scr)
@@ -2357,6 +2524,41 @@ def peripherals_screen(scr, cfg):
             save_cfg(cfg)
 
 
+def draw_config_row(scr, y, row, sel, cfg, gcfg):
+    """One Configure row in the pixel UI: label on the left, value
+    right-aligned, a gold '*' in the last column for a per-game value."""
+    kind = row[0]
+    mark = 2 if gcfg is not None else 0      # columns kept for the marker
+    if kind == "header":
+        draw_header(scr, y, row[1])
+    elif kind == "launch":
+        draw_item(scr, y, 0, "Launch", sel, attr=curses.A_BOLD)
+    elif kind == "back":
+        draw_item(scr, y, 0, "Back", sel)
+    elif kind == "scope":
+        draw_item(scr, y, 0, "Settings apply to", sel)
+        draw_value(scr, y, 0, "< %s >" % ("This game" if gcfg.per_game
+                                          else "All games"),
+                   sel, attr=color(C_HEADER), right=mark)
+    elif kind == "clear":
+        draw_item(scr, y, 0, "Clear this game's settings (*)"
+                  if gcfg.has_overrides() else "(no per-game settings)",
+                  sel, attr=color(C_DIM))
+    elif kind in ("page", "restore"):
+        draw_item(scr, y, 0, "Restore Defaults" if kind == "restore"
+                  else "%s ..." % row[1], sel)
+    else:
+        opt = row[1]
+        on = opt.enabled(cfg)
+        dim = color(C_DIM)
+        draw_item(scr, y, 0, opt.label, sel and on, attr=0 if on else dim)
+        draw_value(scr, y, 0, "< %s >" % opt.display(cfg), sel and on,
+                   attr=None if on else dim, right=mark)
+        if gcfg is not None and gcfg.is_overridden(opt.section, opt.key):
+            _, w = scr.getmaxyx()
+            safe_addstr(scr, y, w - 1, "*", color(C_HEADER))
+
+
 def configure_screen(scr, cfg, subtitle, launch=False, game=None):
     """The Configure menu. With launch=True a Launch entry is pinned on
     top (pre-launch flow); returns True to launch, False/None otherwise.
@@ -2375,7 +2577,7 @@ def configure_screen(scr, cfg, subtitle, launch=False, game=None):
     rows += [("header", "CRT"),
              ("opt", CRT_VOL_OPT), ("opt", VIDEO_OPT), ("opt", FIELD_OPT),
              ("opt", VFILTER_OPT), ("opt", ANALOG_OPT), ("opt", WIFI_OPT),
-             ("opt", VMU_OPT), ("opt", RA_OPT),
+             ("opt", VMU_OPT), ("opt", RA_OPT), ("opt", RA_POPUPS_OPT),
              ("opt", CRT_CLOCK_OPT), ("opt", CRT_EMU_OPT)]
     rows += [("header", "Dreamcast"),
              ("opt", REGION_OPT), ("opt", CABLE_OPT),
@@ -2405,8 +2607,7 @@ def configure_screen(scr, cfg, subtitle, launch=False, game=None):
     while True:
         draw_title(scr, subtitle)
         h, w = scr.getmaxyx()
-        list_top = 4
-        list_h = max(1, h - list_top - 2)
+        list_top, list_h = list_geom(scr, 4)
         cur = selectable[sel]
         if offsets[cur] < top:
             top = offsets[cur]
@@ -2419,64 +2620,74 @@ def configure_screen(scr, cfg, subtitle, launch=False, game=None):
             if list_top <= y < list_top + list_h:
                 safe_addstr(scr, y, x, text, attr)
 
-        for i, row in enumerate(rows):
-            yv = offsets[i]
-            is_sel = (selectable[sel] == i)
-            if row[0] == "launch":
-                text = "  Launch  "
-                if is_sel:
-                    put(yv, 4, ">" + text, color(C_SEL, curses.A_BOLD))
+        if is_pixel(scr):
+            for i, row in enumerate(rows):
+                yv = offsets[i] + (1 if row[0] == "header" else 0)
+                y = list_top + yv - top
+                if list_top <= y < list_top + list_h:
+                    draw_config_row(scr, y, row, selectable[sel] == i,
+                                    cfg, gcfg)
+            draw_footer(scr, "Up/Down: select   Left/Right/A: change"
+                        + ("   * = this game only" if gcfg is not None
+                           and gcfg.has_overrides() else ""),
+                        scroll_pos(top, list_h, total))
+        else:
+            for i, row in enumerate(rows):
+                yv = offsets[i]
+                is_sel = (selectable[sel] == i)
+                if row[0] == "launch":
+                    text = "  Launch  "
+                    if is_sel:
+                        put(yv, 4, ">" + text, color(C_SEL, curses.A_BOLD))
+                    else:
+                        put(yv, 5, text, curses.A_BOLD)
+                elif row[0] == "back":
+                    text = "  Back  "
+                    if is_sel:
+                        put(yv, 4, ">" + text, color(C_SEL, curses.A_BOLD))
+                    else:
+                        put(yv, 5, text)
+                elif row[0] == "scope":
+                    label = "%-28s" % "Settings apply to"
+                    value = "< %s >" % ("This game" if gcfg.per_game else "All games")
+                    attr = color(C_SEL, curses.A_BOLD) if is_sel else color(C_VALUE, curses.A_BOLD)
+                    put(yv, 4 if is_sel else 6, ("> " if is_sel else "") + label,
+                        color(C_SEL, curses.A_BOLD) if is_sel else 0)
+                    put(yv, 6 + len(label) + 2, value, attr)
+                elif row[0] == "clear":
+                    text = ("Clear this game's settings (*)" if gcfg.has_overrides()
+                            else "(no per-game settings)")
+                    if is_sel:
+                        put(yv, 4, "> " + text, color(C_SEL, curses.A_BOLD))
+                    else:
+                        put(yv, 6, text, color(C_DIM))
+                elif row[0] == "header":
+                    put(yv + 1, 2, "[ %s ]" % row[1],
+                        color(C_HEADER, curses.A_BOLD))
+                elif row[0] in ("page", "restore"):
+                    text = ("Restore Defaults" if row[0] == "restore"
+                            else "%s ..." % row[1])
+                    if is_sel:
+                        put(yv, 4, "> " + text, color(C_SEL, curses.A_BOLD))
+                    else:
+                        put(yv, 6, text)
                 else:
-                    put(yv, 5, text, curses.A_BOLD)
-            elif row[0] == "back":
-                text = "  Back  "
-                if is_sel:
-                    put(yv, 4, ">" + text, color(C_SEL, curses.A_BOLD))
-                else:
-                    put(yv, 5, text)
-            elif row[0] == "scope":
-                label = "%-28s" % "Settings apply to"
-                value = "< %s >" % ("This game" if gcfg.per_game else "All games")
-                attr = color(C_SEL, curses.A_BOLD) if is_sel else color(C_VALUE, curses.A_BOLD)
-                put(yv, 4 if is_sel else 6, ("> " if is_sel else "") + label,
-                    color(C_SEL, curses.A_BOLD) if is_sel else 0)
-                put(yv, 6 + len(label) + 2, value, attr)
-            elif row[0] == "clear":
-                text = ("Clear this game's settings (*)" if gcfg.has_overrides()
-                        else "(no per-game settings)")
-                if is_sel:
-                    put(yv, 4, "> " + text, color(C_SEL, curses.A_BOLD))
-                else:
-                    put(yv, 6, text, color(C_DIM))
-            elif row[0] == "header":
-                put(yv + 1, 2, "[ %s ]" % row[1],
-                    color(C_HEADER, curses.A_BOLD))
-            elif row[0] in ("page", "restore"):
-                text = ("Restore Defaults" if row[0] == "restore"
-                        else "%s ..." % row[1])
-                if is_sel:
-                    put(yv, 4, "> " + text, color(C_SEL, curses.A_BOLD))
-                else:
-                    put(yv, 6, text)
-            else:
-                opt = row[1]
-                label = "%-28s" % opt.label
-                value = "< %s >" % opt.display(cfg)
-                if gcfg is not None and gcfg.is_overridden(opt.section, opt.key):
-                    value += " *"
-                if not opt.enabled(cfg):
-                    put(yv, 6, label, color(C_DIM))
-                    put(yv, 6 + len(label) + 2, value, color(C_DIM))
-                elif is_sel:
-                    put(yv, 4, "> " + label, color(C_SEL, curses.A_BOLD))
-                    put(yv, 6 + len(label) + 2, value,
-                        color(C_SEL, curses.A_BOLD))
-                else:
-                    put(yv, 6, label)
-                    put(yv, 6 + len(label) + 2, value, color(C_VALUE))
-
-        footer = "UP/DOWN: select   LEFT/RIGHT/ENTER/A: change"
-        safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
+                    opt = row[1]
+                    label = "%-28s" % opt.label
+                    value = "< %s >" % opt.display(cfg)
+                    if gcfg is not None and gcfg.is_overridden(opt.section, opt.key):
+                        value += " *"
+                    if not opt.enabled(cfg):
+                        put(yv, 6, label, color(C_DIM))
+                        put(yv, 6 + len(label) + 2, value, color(C_DIM))
+                    elif is_sel:
+                        put(yv, 4, "> " + label, color(C_SEL, curses.A_BOLD))
+                        put(yv, 6 + len(label) + 2, value,
+                            color(C_SEL, curses.A_BOLD))
+                    else:
+                        put(yv, 6, label)
+                        put(yv, 6 + len(label) + 2, value, color(C_VALUE))
+            draw_footer(scr, "Up/Down: select   Left/Right/A: change")
         scr.refresh()
 
         def move_sel(delta):
@@ -2577,6 +2788,7 @@ def ui(scr):
             if external:
                 game_dirs = resolve_game_dirs(cfg)
                 games = scan_games(game_dirs)
+    GAME_LIST[:] = games          # for the emulator's games.json
 
     NAV[0] = NavPump()
     try:
@@ -2598,6 +2810,113 @@ def ui(scr):
     finally:
         NAV[0].close()
         NAV[0] = None
+
+
+# the game list the menu showed last: (label, path) as from scan_games()
+GAME_LIST = []
+
+# ---- pixel UI session ------------------------------------------------------
+# One framebuffer session for the whole run (menus, the loading notice, the
+# game, the list again through the console mirror): the console stays in
+# KD_GRAPHICS so nothing the launcher prints in between lands on the picture,
+# and it is handed back (KD_TEXT, pixels restored) before MiSTer restarts.
+DISPLAY = [None]
+_CONSOLE_RE = re.compile(r"/dev/(tty\d+|console)$")
+
+
+def ui_overscan(cfg):
+    """[dreamster] UiOverscan = x,y - percent of each edge kept clear
+    (blank: the emulator's own margins, 32 px / 12 lines)."""
+    v = cfg.get("dreamster", "UiOverscan", fallback="").strip()
+    try:
+        x, y = (float(p) for p in v.split(","))
+        return (max(0.0, min(x, 25.0)), max(0.0, min(y, 25.0)))
+    except ValueError:
+        return None
+
+
+def open_display():
+    """Starts the pixel UI if it can run here; None = curses UI."""
+    want = os.environ.get("DREAMSTER_UI", "").strip().lower()
+    if want == "curses" or dsui is None:
+        return None
+    if want != "fb":
+        # only on the console itself: over ssh (a pty) the picture would be
+        # on a screen nobody running the menu can see
+        try:
+            if not _CONSOLE_RE.match(os.ttyname(1)):
+                return None
+        except OSError:
+            return None
+    try:
+        d = dsui.FbDisplay.open_device(overscan=ui_overscan(load_cfg()))
+    except Exception as e:
+        crt_log("pixel ui unavailable (%s): curses ui" % e)
+        return None
+    crt_log("pixel ui: %s" % d.describe())
+    DISPLAY[0] = d
+    PIXEL[0] = True
+    return d
+
+
+def close_display():
+    d = DISPLAY[0]
+    DISPLAY[0] = None
+    PIXEL[0] = False
+    if d is not None:
+        try:
+            d.close()
+        except Exception as e:
+            crt_log("pixel ui close: %s" % e)
+
+
+def text_console():
+    """Curses UI on the console: make sure the VT draws text (a pixel UI
+    killed with SIGKILL leaves it in KD_GRAPHICS)."""
+    try:
+        if _CONSOLE_RE.match(os.ttyname(1)):
+            fcntl.ioctl(1, 0x4B3A, 0)         # KDSETMODE KD_TEXT
+    except OSError:
+        pass
+
+
+def run_ui():
+    """The menus, on the framebuffer when a pixel session is open. Returns
+    the game to launch or None."""
+    d = DISPLAY[0]
+    if d is None:
+        return curses.wrapper(ui)
+    try:
+        if d.check_geometry():
+            crt_log("pixel ui: mode changed, %s" % d.describe())
+    except Exception as e:
+        crt_log("pixel ui: geometry check failed: %s" % e)
+
+    def pixel_ui(stdscr):
+        # curses still owns the tty (keys, escape sequences, ssh) - it just
+        # never draws: the VT is in graphics mode
+        return ui(dsui.FbWindow(d, stdscr, fb_styles(), curses.A_BOLD))
+    return curses.wrapper(pixel_ui)
+
+
+def pixel_notice(subtitle, lines=(), footer=""):
+    """A static page on the framebuffer (e.g. while a game loads)."""
+    d = DISPLAY[0]
+    if d is None:
+        return
+    try:
+        win = dsui.FbWindow(d, None, fb_styles(), curses.A_BOLD)
+        draw_title(win, subtitle)
+        h, w = win.getmaxyx()
+        y = max(3, h // 2 - len(lines) // 2 - 1)
+        for i, line in enumerate(lines):
+            safe_addstr(win, y + i, max(0, (w - len(line)) // 2), line,
+                        curses.A_BOLD if i == 0 else color(C_DIM))
+        if footer:
+            draw_footer(win, footer)
+        win.refresh()
+    except Exception as e:
+        crt_log("pixel notice failed: %s" % e)
 
 
 # ---------------------------------------------------------------- launch ---
@@ -3175,7 +3494,21 @@ class ConsoleMirror(threading.Thread):
         self.vram = mmap.mmap(self.mem_fd, (2 * size + 4095) & ~4095, offset=vram)
         self.maps.append(self.vram)
         self.fb_fd = os.open("/dev/fb0", os.O_RDONLY)
-        self.fb = mmap.mmap(self.fb_fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+        try:
+            self.fb = mmap.mmap(self.fb_fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+        except OSError as e:
+            # 6.x fbdev refuses mmap on MiSTer_fb (no fb_mmap): read the
+            # pixels where the driver says they are (FSCREENINFO smem_start)
+            if e.errno not in (errno.ENODEV, errno.EINVAL):
+                raise
+            fix = bytearray(80)
+            fcntl.ioctl(self.fb_fd, 0x4602, fix, True)   # FBIOGET_FSCREENINFO
+            start = struct.unpack_from("I", fix, 16)[0]
+            if not start:
+                raise
+            self.fb = mmap.mmap(self.mem_fd, size, mmap.MAP_SHARED,
+                                mmap.PROT_READ, offset=start)
+            crt_log("mirror: fb0 read through /dev/mem at 0x%08X" % start)
         self.maps.append(self.fb)
         self.dst = memoryview(self.vram).cast("I")[0:2 * (size // 4):2]
         self.src = memoryview(self.fb).cast("I")
@@ -3196,7 +3529,10 @@ class ConsoleMirror(threading.Thread):
         last = None
         while not self.stop.wait(0.08):
             try:
-                snap = self.fb[:]
+                d = DISPLAY[0]
+                # the pixel UI counts its redraws; the text console has to
+                # be compared (a full fb0 read)
+                snap = ("frames", d.frames) if d is not None else self.fb[:]
                 if snap != last:
                     self.copy()
                     last = snap
@@ -3237,11 +3573,17 @@ class ConsoleMirror(threading.Thread):
 PVR_CRT_CTRL = 0x34
 
 
-def crt_ctrl_value(cfg, mode):
-    field = 1 if FIELD_OPT.current(cfg) == "correct" else 0
+def effective_vfilter(cfg, mode):
+    """The vertical filter a video mode really gets (Auto resolved)."""
     filt = VFILTER_OPT.current(cfg)
     if filt == "auto":
         filt = "smooth" if mode.startswith("480i") else "off"
+    return filt
+
+
+def crt_ctrl_value(cfg, mode):
+    field = 1 if FIELD_OPT.current(cfg) == "correct" else 0
+    filt = effective_vfilter(cfg, mode)
     # [3] 240p on the run-time-switchable (LINE_MODE 3) bitstream; the
     # fixed-mode builds ignore it
     p240 = 8 if mode.startswith("240p") else 0
@@ -3465,6 +3807,23 @@ def _oc12_guard(cfg):
     cfg.per_game = False
 
 
+def select_bitstream(cfg):
+    """(video mode, bitstream, notes) a launch with these settings uses."""
+    notes = []
+    mode = VIDEO_OPT.current(cfg)
+    rbf = CRT_BITSTREAMS.get(mode, BITSTREAM_RBF)
+    if ANALOG_OPT.current(cfg) == "ypbpr":
+        # only the unified build sends YPbPr; it does 240p and 480i
+        if os.path.exists(YPBPR_RBF):
+            rbf = YPBPR_RBF
+        else:
+            notes.append("unified bitstream missing - analog output will be RGB")
+    if not os.path.exists(rbf):
+        notes.append("%s bitstream missing, using 240p" % mode)
+        mode, rbf = "240p", CRT_BITSTREAMS["240p"]
+    return mode, rbf, notes
+
+
 def launch(game, overclock, cfg=None):
     cfg = effective_cfg(game, base=cfg if not isinstance(cfg, GameCfg) else cfg.base)
     _oc12_guard(cfg)
@@ -3473,17 +3832,9 @@ def launch(game, overclock, cfg=None):
     oc_khz = "1200000" if oc_step == "2" else "1000000"
     if cfg.has_overrides():
         crt_log("per-game settings: %s" % game_cfg_path(game))
-    mode = VIDEO_OPT.current(cfg)
-    rbf = CRT_BITSTREAMS.get(mode, BITSTREAM_RBF)
-    if ANALOG_OPT.current(cfg) == "ypbpr":
-        # only the unified build sends YPbPr; it does 240p and 480i
-        if os.path.exists(YPBPR_RBF):
-            rbf = YPBPR_RBF
-        else:
-            print("unified bitstream missing - analog output will be RGB")
-    if not os.path.exists(rbf):
-        print("%s bitstream missing, using 240p" % mode)
-        mode, rbf = "240p", CRT_BITSTREAMS["240p"]
+    mode, rbf, notes = select_bitstream(cfg)
+    for note in notes:
+        print(note)
     crt_log("bitstream %s" % os.path.basename(rbf))
     if not (os.path.exists(rbf) and os.path.exists(HDMI15K)):
         print("CRT bitstream or hdmi15k.py missing - refusing to launch (would not be 15 kHz)")
@@ -3616,18 +3967,25 @@ def launch(game, overclock, cfg=None):
         if game != "nodisk" and VMU_OPT.current(cfg) == "game":
             vmu_swap_in(game)
         env = None
-        if os.path.exists(PROFILE_FLAG):
+        # (its own flag: env also carries the RA switches below, and used
+        # to start perf on every dry-run launch)
+        profiling = os.path.exists(PROFILE_FLAG)
+        if profiling:
             env = profile_env()
         ra_mode = RA_OPT.current(cfg)
         if ra_mode in ("off", "dryrun"):
             env = dict(env if env is not None else os.environ)
             env["MINICAST_RA" if ra_mode == "off" else "MINICAST_RA_DRYRUN"] = (
                 "0" if ra_mode == "off" else "1")
-        crt_log("retroachievements: %s" % ra_mode)
+        popups = RA_POPUPS_OPT.current(cfg)
+        if popups in ("on", "off"):
+            env = dict(env if env is not None else os.environ)
+            env["MINICAST_RA_POPUPS"] = "1" if popups == "on" else "0"
+        crt_log("retroachievements: %s, popups %s" % (ra_mode, popups))
         with open(os.path.join(MINICAST_LOG_DIR, log_name + ".log"), "w") as logf:
             vol.proc = subprocess.Popen([elf, game], cwd=MINICAST_DIR, env=env,
                                         stdout=logf, stderr=subprocess.STDOUT)
-        if env is not None:
+        if profiling:
             prof = profile_start(vol.proc.pid, elf)
         vol.proc.wait()
     finally:
@@ -3660,6 +4018,213 @@ def launch(game, overclock, cfg=None):
                 pass
             if prev_gov:
                 _cpufreq_write("scaling_governor", prev_gov)
+
+
+# ---- emulator <-> launcher protocol ----------------------------------------
+# The emulator's in-game menu (Start+Select / Start+R) can switch games,
+# change a few options and quit DreamSTer. Files in IPC_DIR (tmpfs):
+#   games.json          launcher -> emulator, before each launch:
+#                       {"games": [{"name", "path"}, ...], "current": path}
+#                       (names as in the game list; current "" = BIOS)
+#   options.json        launcher -> emulator, before each launch: the values
+#                       in effect, "auto" resolved - {"volume": "0".."7" |
+#                       "mute", "vfilter": off|light|smooth, "field":
+#                       correct|original, "popups": on|off}
+#   options_changed.json  emulator -> launcher, on exit: options the menu
+#                       changed (same keys); persisted to emu.cfg - to the
+#                       game's own file for keys the game overrides, else
+#                       globally
+#   request.json        emulator -> launcher, on exit: {"action": "load",
+#                       "path": P} launches P right away, {"action": "exit"}
+#                       leaves DreamSTer; none = back to the game list
+# Written atomically (temp file + rename); stale emulator files are removed
+# before each launch.
+IPC_DIR = "/tmp/dreamster"
+IPC_GAMES, IPC_OPTIONS = "games.json", "options.json"
+IPC_CHANGED, IPC_REQUEST = "options_changed.json", "request.json"
+RA_CFG_PATH = "/media/fat/retroachievements.cfg"
+
+
+def _ipc_path(name):
+    return os.path.join(IPC_DIR, name)
+
+
+def _write_json_atomic(path, obj):
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+def _take_json(name):
+    """Reads and removes an emulator file; None if absent or unreadable."""
+    path = _ipc_path(name)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        crt_log("ipc: bad %s: %s" % (name, e))
+        data = None
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return data
+
+
+def ra_cfg_popups(path=None):
+    """retroachievements.cfg dreamster_popups, read the way minicast does
+    (key before '=' compared case-insensitively, atoi value, default on)."""
+    on = True
+    try:
+        with open(path or RA_CFG_PATH, errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\r\n")
+                if not line or line[0] == "#" or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.lower() == "dreamster_popups":
+                    m = re.match(r"\s*([+-]?\d+)", val)
+                    on = bool(m and int(m.group(1)))
+    except OSError:
+        pass
+    return on
+
+
+def emulator_options(game):
+    """options.json: the values a launch of `game` runs with."""
+    cfg = effective_cfg(game)
+    mode, _, _ = select_bitstream(cfg)
+    att = crt_volume_att(cfg)
+    popups = RA_POPUPS_OPT.current(cfg)
+    if popups not in ("on", "off"):
+        popups = "on" if ra_cfg_popups() else "off"
+    return {"volume": "mute" if att & 0x10 else str(att & 0x7),
+            "vfilter": effective_vfilter(cfg, mode),
+            "field": FIELD_OPT.current(cfg),
+            "popups": popups}
+
+
+def write_launch_ipc(game, games):
+    """games.json + options.json for the emulator; stale answers removed.
+    Never blocks a launch."""
+    try:
+        os.makedirs(IPC_DIR, exist_ok=True)
+        for name in (IPC_REQUEST, IPC_CHANGED):
+            try:
+                os.remove(_ipc_path(name))
+            except FileNotFoundError:
+                pass
+        _write_json_atomic(_ipc_path(IPC_GAMES), {
+            "games": [{"name": name, "path": path} for name, (_, path)
+                      in zip(display_names(games), games)],
+            "current": "" if game == "nodisk" else game})
+        _write_json_atomic(_ipc_path(IPC_OPTIONS), emulator_options(game))
+    except Exception as e:
+        crt_log("ipc: launch files not written: %s" % e)
+
+
+def _norm_option(key, raw):
+    """(Option, cfg value) for one options_changed entry, or None."""
+    v = raw if isinstance(raw, bool) else str(raw).strip().lower()
+    if key == "volume":
+        if v == "mute" or (v in [str(n) for n in range(8)]):
+            return CRT_VOL_OPT, v
+    elif key == "vfilter":
+        if v in ("off", "light", "smooth", "auto"):
+            return VFILTER_OPT, v
+    elif key == "field":
+        if v in ("correct", "original"):
+            return FIELD_OPT, v
+    elif key == "popups":
+        if v in (True, "on", "1", "true", "yes"):
+            return RA_POPUPS_OPT, "on"
+        if v in (False, "off", "0", "false", "no"):
+            return RA_POPUPS_OPT, "off"
+    return None
+
+
+def apply_options_changed(game):
+    """Persists what the in-game menu changed; returns {cfg key: value}."""
+    data = _take_json(IPC_CHANGED)
+    if not isinstance(data, dict):
+        return {}
+    changes = []
+    for key, raw in data.items():
+        norm = _norm_option(key, raw)
+        if norm is None:
+            crt_log("ipc: ignoring option %s=%r" % (key, raw))
+        else:
+            changes.append(norm)
+    if not changes:
+        return {}
+    gcfg = effective_cfg(game)
+    for opt, value in changes:
+        # a key this game overrides stays per game (a global change would be
+        # invisible for it); everything else is the global setting
+        gcfg.per_game = gcfg.is_overridden(opt.section, opt.key)
+        opt.set(gcfg, value)
+    gcfg.per_game = False
+    save_cfg(gcfg)
+    done = dict((opt.key, value) for opt, value in changes)
+    crt_log("in-game menu changed %s" % done)
+    return done
+
+
+def take_request():
+    """The emulator's request: ("load", path), ("exit",) or None."""
+    data = _take_json(IPC_REQUEST)
+    if not isinstance(data, dict):
+        return None
+    action = data.get("action")
+    if action == "exit":
+        return ("exit",)
+    if action == "load":
+        path = data.get("path")
+        if isinstance(path, str) and (path == "nodisk" or os.path.isfile(path)):
+            return ("load", path)
+        crt_log("ipc: load request for a missing game: %r" % (path,))
+        return None
+    crt_log("ipc: unknown request %r" % (data,))
+    return None
+
+
+def game_title(game, games):
+    if game == "nodisk":
+        return "Dreamcast BIOS"
+    for name, (_, path) in zip(display_names(games), games):
+        if path == game:
+            return name
+    return os.path.basename(game)
+
+
+def play(game, games):
+    """Runs a game, then whatever the emulator's in-game menu asked for on
+    the way out: the next game straight away, or leaving DreamSTer.
+    Returns "exit", or None to go back to the game list."""
+    while True:
+        cfg = load_cfg()
+        overclock = cfg.get("dreamster", "Overclock",
+                            fallback="0").strip() == "1"
+        write_launch_ipc(game, games)
+        pixel_notice("Starting", [game_title(game, games), "",
+                                  "Loading the emulator..."])
+        launch(game, overclock, cfg)
+        try:
+            apply_options_changed(game)
+            req = take_request()
+        except Exception as e:           # never strand the user over this
+            crt_log("ipc: after-game handling failed: %s" % e)
+            req = None
+        if req is None:
+            return None
+        if req[0] == "exit":
+            crt_log("in-game menu: exit DreamSTer")
+            return "exit"
+        crt_log("in-game menu: load %s" % req[1])
+        game = req[1]
 
 
 # ---- quick launch from MiSTer's main menu --------------------------------
@@ -3755,29 +4320,46 @@ def main():
     vmu_swap_out()          # a game that never came back still owns vmu A1
 
     if len(sys.argv) > 2 and sys.argv[1] == "--launch":
-        # quick launch: straight into the game with the saved settings,
-        # back to MiSTer's menu when it exits
+        # quick launch: straight into the game with the saved settings (and
+        # any game the in-game menu switches to), back to MiSTer's menu when
+        # it exits
         try:
-            cfg = load_cfg()
-            overclock = cfg.get("dreamster", "Overclock", fallback="0").strip() == "1"
-            launch(sys.argv[2], overclock, cfg)
+            try:
+                games = scan_games(resolve_game_dirs(load_cfg()))
+            except Exception as e:
+                crt_log("quick launch: game scan failed: %s" % e)
+                games = []
+            play(sys.argv[2], games)
         finally:
             restart_mister()
         return
 
+    os.environ.setdefault("TERM", "linux")    # scripts start without TERM
+    if open_display() is None:
+        text_console()
     mirror = None
     try:
         while True:
-            game = curses.wrapper(ui)
+            try:
+                game = run_ui()
+            except Exception:
+                if DISPLAY[0] is None:
+                    raise
+                # a pixel UI failure must not cost the session: log it and
+                # carry on with the text UI
+                import traceback
+                crt_log("pixel ui failed, switching to curses:\n%s"
+                        % traceback.format_exc())
+                close_display()
+                text_console()
+                game = run_ui()
             if mirror:
                 mirror.close()
                 mirror = None
             if game is None:
                 break
-            cfg = load_cfg()
-            overclock = cfg.get("dreamster", "Overclock",
-                                fallback="0").strip() == "1"
-            launch(game, overclock, cfg)
+            if play(game, list(GAME_LIST)) == "exit":
+                break
             # back to the game list, shown through the CRT bitstream; if the
             # console can't be mirrored, fall back to the MiSTer menu
             mirror = ConsoleMirror.start_if_possible() if RETURN_TO_LIST else None
@@ -3786,6 +4368,7 @@ def main():
     finally:
         if mirror:
             mirror.close()
+        close_display()
         try:
             sync_menu()          # keep the _Dreamcast menu entries current
         except Exception as e:
