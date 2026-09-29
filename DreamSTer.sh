@@ -480,9 +480,16 @@ VFILTER_OPT = Option("Vertical filter", "CrtVFilter",
 WIFI_OPT = Option("WiFi during games", "CrtWifiPause",
                   [("pause", "Pause (fixes lost inputs)"), ("keep", "Keep on")],
                   "pause", section="dreamster")
+# One bitstream per fast clock: the r7 core clock is a hard 2:1 switch, so a
+# build carries 75 MHz plus ONE fast slot (CLK bit 1). 112.5 MHz is the
+# fastest but marginal (GPU hangs when the FPGA runs warm); 100 MHz is the
+# same design with a 75 / 100 MHz PLL - "100" loads that file and selects its
+# fast slot.
 CRT_CLOCK_OPT = Option("CRT Clock (r7)", "CrtClockSelR7",
-                       [("0", "75 MHz"), ("2", "112.5 MHz")], "2",
+                       [("0", "75 MHz"), ("100", "100 MHz (stable when warm)"),
+                        ("2", "112.5 MHz")], "2",
                        section="dreamster")
+UNIFIED_100_RBF = os.path.join(MINICAST_DIR, "polly2-rtl-crt-r7mv-unified-100.rbf")
 
 # every option Restore Defaults resets; OPTMODE last so the balanced preset
 # is what ends up in the OPT_ITEMS keys
@@ -3856,6 +3863,13 @@ def select_bitstream(cfg):
             rbf = YPBPR_RBF
         else:
             notes.append("unified bitstream missing - analog output will be RGB")
+    if CRT_CLOCK_OPT.current(cfg) == "100":
+        # 100 MHz: the unified design built with a 75 / 100 MHz PLL (240p and
+        # 480i, shadows, RGB / YPbPr) - whatever the video mode picked above
+        if os.path.exists(UNIFIED_100_RBF):
+            rbf = UNIFIED_100_RBF
+        else:
+            notes.append("100 MHz bitstream missing - it would run at 112.5 MHz")
     if not os.path.exists(rbf):
         notes.append("%s bitstream missing, using 240p" % mode)
         mode, rbf = "240p", CRT_BITSTREAMS["240p"]
@@ -3961,7 +3975,9 @@ def launch(game, overclock, cfg=None):
     except Exception as e:           # never block a launch over this
         crt_log("pad auto-mapping failed: %s" % e)
     undo_overrides = _apply_overrides(cfg.over)
-    prev_clk = _force_clocksel(CRT_CLOCK_OPT.current(cfg))
+    clk_opt = CRT_CLOCK_OPT.current(cfg)
+    # "100" = the 75/100 MHz bitstream's fast slot (ClockSel 2 on that file)
+    prev_clk = _force_clocksel("2" if clk_opt == "100" else clk_opt)
     try:
         esc = UinputKeys()
     except OSError as e:
