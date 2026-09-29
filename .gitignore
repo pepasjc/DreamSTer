@@ -1,0 +1,8 @@
+*.elf
+*.rbf
+*.wav
+perf
+old/
+*_patch.py
+fixnul.py
+__pycache__/
