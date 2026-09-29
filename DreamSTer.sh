@@ -459,6 +459,11 @@ RA_POPUPS_OPT = Option("Achievement popups", "CrtRaPopups",
                        [("auto", "As retroachievements.cfg"), ("on", "On"),
                         ("off", "Off")],
                        "auto", section="dreamster")
+# emulator builds with the audio feeder thread ([audio] threaded, read by
+# minicast): Off restores the direct FIFO pushes from the emulation thread
+AUDIO_THREAD_OPT = Option("Audio feeder thread", "threaded",
+                          [("1", "On (faster)"), ("0", "Off (direct)")],
+                          "1", section="audio")
 VMU_OPT = Option("VMU saves", "CrtVmuPerGame",
                  [("game", "Per game (GameSync)"), ("shared", "Shared (one VMU)")],
                  "game", section="dreamster")
@@ -484,7 +489,7 @@ CRT_CLOCK_OPT = Option("CRT Clock (r7)", "CrtClockSelR7",
 ALL_OPTIONS = [REGION_OPT, CABLE_OPT, OVERCLOCK_OPT, TIMEREC_OPT, AUDIO_OPT,
                FPS_OPT, AUTORESET_OPT, CLOCK_OPT, DUMP_OPT,
                CRT_VOL_OPT, VIDEO_OPT, ANALOG_OPT, FIELD_OPT, VFILTER_OPT, WIFI_OPT,
-               VMU_OPT, RA_OPT, RA_POPUPS_OPT,
+               VMU_OPT, RA_OPT, AUDIO_THREAD_OPT, RA_POPUPS_OPT,
                CRT_CLOCK_OPT,
                CRT_EMU_OPT] + OPT_ITEMS \
               + [OPTMODE_OPT]
@@ -2577,7 +2582,7 @@ def configure_screen(scr, cfg, subtitle, launch=False, game=None):
     rows += [("header", "CRT"),
              ("opt", CRT_VOL_OPT), ("opt", VIDEO_OPT), ("opt", FIELD_OPT),
              ("opt", VFILTER_OPT), ("opt", ANALOG_OPT), ("opt", WIFI_OPT),
-             ("opt", VMU_OPT), ("opt", RA_OPT), ("opt", RA_POPUPS_OPT),
+             ("opt", VMU_OPT), ("opt", RA_OPT), ("opt", AUDIO_THREAD_OPT), ("opt", RA_POPUPS_OPT),
              ("opt", CRT_CLOCK_OPT), ("opt", CRT_EMU_OPT)]
     rows += [("header", "Dreamcast"),
              ("opt", REGION_OPT), ("opt", CABLE_OPT),
