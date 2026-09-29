@@ -3265,6 +3265,10 @@ HOTKEY_DEFAULTS = ((0x13b, "start"), (0x133, "up"), (0x134, "down"),
                    (0x136, "quit"), (0x138, "quit"))
 
 
+# emulator builds with the in-game menu (Start+L / Start+Select opens it)
+MENU_ELFS = ("minicast-crt-tacore-ra.elf",)
+
+
 def pad_hotkey_codes(cfg):
     """{key code: role} from every [inputN] section's key: mappings."""
     codes = {}
@@ -3959,6 +3963,10 @@ def launch(game, overclock, cfg=None):
         esc = None
         crt_log("uinput unavailable: %s" % e)
     codes = pad_hotkey_codes(cfg)
+    # builds with the in-game menu take Start+L themselves (it opens the
+    # menu, whose Exit Game / Exit Emulator replace the quit shortcut)
+    if os.path.basename(elf) in MENU_ELFS:
+        codes = {c: r for c, r in codes.items() if r != "quit"}
     crt_log("launch %s hotkeys=%s" % (game, codes))
     vol = VolumeKeys(crt_volume_att(cfg), codes, esc)
     wifi_paused = []
