@@ -3228,6 +3228,31 @@ def write_audio_vol(att):
         os.close(fd)
 
 
+def read_audio_vol():
+    """AUDIO_VOL as the core holds it now (minicast's in-game menu writes it
+    too); None when the LW bridge is in reset or the read fails."""
+    try:
+        fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+    except OSError:
+        return None
+    try:
+        m = mmap.mmap(fd, 4096, offset=RSTMGR_BASE)
+        brg = struct.unpack_from("<I", m, RSTMGR_BRGMODRST)[0]
+        m.close()
+        if brg & 0x2:
+            return None
+        m = mmap.mmap(fd, 4096, offset=PVR_CFG_BASE)
+        rev = struct.unpack_from("<I", m, PVR_REVISION)[0]
+        v = struct.unpack_from("<I", m, PVR_AUDIO_VOL_R7 if rev >= 6
+                               else PVR_AUDIO_VOL)[0]
+        m.close()
+        return v & 0x17
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+
+
 # pad hotkeys while a game runs (held Start + button), from the mapped
 # [inputN] buttons: Start+X volume up, Start+Y volume down, Start+L quit
 HOTKEY_ROLES = {"ButtonStart": "start", "ButtonX": "up", "ButtonY": "down",
@@ -3630,6 +3655,10 @@ class VolumeKeys(threading.Thread):
         self.proc = None               # minicast Popen, for Start+L
 
     def _step(self, what):
+        # start from what the core has: the in-game menu may have changed it
+        cur = read_audio_vol()
+        if cur is not None:
+            self.att = cur
         lvl, mute = self.att & 0x7, self.att & 0x10
         if what == "mute":
             mute ^= 0x10
@@ -3999,8 +4028,9 @@ def launch(game, overclock, cfg=None):
         if prev_clk is not None:
             _force_clocksel(prev_clk)
         _restore_overrides(undo_overrides)
-        if vol.changed:
+        if vol.changed and not options_changed_has("volume"):
             # keep the level picked with the volume keys for next time
+            # (a volume from the in-game menu wins: apply_options_changed)
             c = load_cfg()
             CRT_VOL_OPT.set(c, "mute" if vol.att & 0x10 else str(vol.att & 0x7))
             save_cfg(c)
@@ -4072,6 +4102,32 @@ def _take_json(name):
     except OSError:
         pass
     return data
+
+
+def options_changed_has(key):
+    """Whether the emulator's options_changed.json carries a valid `key`
+    (read only; apply_options_changed() consumes the file)."""
+    try:
+        with open(_ipc_path(IPC_CHANGED)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return (isinstance(data, dict) and key in data
+            and _norm_option(key, data[key]) is not None)
+
+
+def list_path(game, games):
+    """`game` spelled exactly like its game list entry (the emulator matches
+    games.json's "current" against the entries by string); unchanged when
+    it isn't in the list."""
+    paths = [p for _, p in games]
+    if game in paths:
+        return game
+    real = os.path.realpath(game)
+    for p in paths:
+        if os.path.realpath(p) == real:
+            return p
+    return game
 
 
 def ra_cfg_popups(path=None):
@@ -4205,6 +4261,8 @@ def play(game, games):
     the way out: the next game straight away, or leaving DreamSTer.
     Returns "exit", or None to go back to the game list."""
     while True:
+        if game != "nodisk":
+            game = list_path(game, games)   # e.g. a --launch argument
         cfg = load_cfg()
         overclock = cfg.get("dreamster", "Overclock",
                             fallback="0").strip() == "1"
