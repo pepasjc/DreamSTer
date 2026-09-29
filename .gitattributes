@@ -1,0 +1,4 @@
+# deployed to the MiSTer as-is: a CRLF checkout (core.autocrlf) would break
+# the python3 shebang
+*.sh text eol=lf
+*.py text eol=lf
