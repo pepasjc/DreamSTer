@@ -487,7 +487,7 @@ WIFI_OPT = Option("WiFi during games", "CrtWifiPause",
 # fast slot.
 CRT_CLOCK_OPT = Option("CRT Clock (r7)", "CrtClockSelR7",
                        [("0", "75 MHz"), ("100", "100 MHz (stable when warm)"),
-                        ("2", "112.5 MHz")], "2",
+                        ("2", "112.5 MHz")], "100",
                        section="dreamster")
 UNIFIED_100_RBF = os.path.join(MINICAST_DIR, "polly2-rtl-crt-r7mv-unified-100.rbf")
 
