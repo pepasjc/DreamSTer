@@ -3876,6 +3876,17 @@ def select_bitstream(cfg):
     return mode, rbf, notes
 
 
+# how the last emulator run ended: (exit code or None, seconds it ran)
+LAST_RUN = [None, 0.0]
+# an abnormal exit sooner than this = the emulator died while starting up
+EARLY_CRASH_SECS = 15
+
+
+def early_crash():
+    rc, secs = LAST_RUN
+    return rc != 0 and secs < EARLY_CRASH_SECS
+
+
 def launch(game, overclock, cfg=None):
     cfg = effective_cfg(game, base=cfg if not isinstance(cfg, GameCfg) else cfg.base)
     _oc12_guard(cfg)
@@ -4040,12 +4051,15 @@ def launch(game, overclock, cfg=None):
             env = dict(env if env is not None else os.environ)
             env["MINICAST_RA_POPUPS"] = "1" if popups == "on" else "0"
         crt_log("retroachievements: %s, popups %s" % (ra_mode, popups))
+        LAST_RUN[:] = [None, 0.0]
+        started = time.monotonic()
         with open(os.path.join(MINICAST_LOG_DIR, log_name + ".log"), "w") as logf:
             vol.proc = subprocess.Popen([elf, game], cwd=MINICAST_DIR, env=env,
                                         stdout=logf, stderr=subprocess.STDOUT)
         if profiling:
             prof = profile_start(vol.proc.pid, elf)
         vol.proc.wait()
+        LAST_RUN[:] = [vol.proc.returncode, time.monotonic() - started]
     finally:
         profile_stop(prof)
         vmu_swap_out()
@@ -4302,6 +4316,13 @@ def play(game, games):
         pixel_notice("Starting", [game_title(game, games), "",
                                   "Loading the emulator..."])
         launch(game, overclock, cfg)
+        if early_crash():
+            # the game never got going: mirroring the list into VRAM now
+            # hangs the HPS (only safe after a game ran), so leave to the
+            # MiSTer menu instead
+            crt_log("emulator crashed at start-up (%s after %.1f s), "
+                    "back to the MiSTer menu" % tuple(LAST_RUN))
+            return "exit"
         try:
             apply_options_changed(game)
             req = take_request()
