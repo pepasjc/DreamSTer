@@ -2976,15 +2976,18 @@ def detect_parent_mister():
         MISTER["pid"] = ppid
         MISTER["exe"] = exe
         return
-    # a forked main binary (Console Mode's MiSTer_ConsoleMode runs scripts on
-    # tty2 from its own host): find it, parent or not. Killing it would hang
-    # up the terminal we run on, and a stock MiSTer restart would not bring
-    # its frontend back - so it is paused instead and resumed on exit.
+    # the main binary is not our parent: Console Mode's MiSTer_ConsoleMode
+    # and stock MiSTer both run scripts through agetty on tty2, and quick
+    # launch comes from dcwatch. Find it, parent or not. Killing it would hang
+    # up the terminal the script runs on (stock MiSTer's Scripts page: the
+    # launcher died with it and nothing came back - a soft freeze), and a
+    # stock restart would not bring Console Mode's frontend back - so it is
+    # paused instead and restarted fresh, boot-like, after we exit.
     for d in os.listdir("/proc"):
         if not d.isdigit() or int(d) == os.getpid():
             continue
         exe = _proc_exe(int(d))
-        if _is_main_binary(exe) and os.path.basename(exe) != os.path.basename(MISTER_BIN):
+        if _is_main_binary(exe):
             try:
                 with open("/proc/%s/cmdline" % d, "rb") as f:
                     argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
@@ -4439,6 +4442,9 @@ def main():
     except OSError:
         pass
     detect_parent_mister()
+    crt_log("start (%s): main binary %s pid %s%s" % (
+        " ".join(sys.argv[1:2]) or "menu", MISTER.get("exe"), MISTER.get("pid"),
+        ", paused/restarted fresh" if MISTER.get("fork") else ""))
     kill_mister()
     recover_overrides()
     vmu_swap_out()          # a game that never came back still owns vmu A1
