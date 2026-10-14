@@ -9,6 +9,11 @@ Audio CTS is left in automatic mode by setup_hdmi (reg 0x0A[7]=0), so the
 
   hdmi15k.py            apply the 15 kHz registers + DV1 SPD for 480i
   hdmi15k.py --240p     same, DV1 SPD describing the 240p bitstream
+  hdmi15k.py --tv       standard HDMI for a TV instead: CEA 1440x480i (VIC 6)
+                        or, with --240p, 1440x240p (VIC 8), 4:3, pixel
+                        repetition by the chip, no DV1 SPD - needs a bitstream
+                        with CRT_CTRL[5] (REVISION 8) set, which switches the
+                        HDMI pins to separate syncs + active-picture DE
   hdmi15k.py --probe    print ADV7513 status (detected input VIC, HPD, PLL)
 
 Direct-video DACs (e.g. MiSTercade V2) rely on Main_MiSTer's custom "DV1"
@@ -95,11 +100,27 @@ def probe(fd, bus):
     print("  HPD=%d monitor-sense=%d (0x42)  : 0x%02X" % ((r[0x42] >> 6) & 1, (r[0x42] >> 5) & 1, r[0x42]))
     print("  PLL locked=%d (0x9E)            : 0x%02X" % ((r[0x9E] >> 4) & 1, r[0x9E]))
 
+def tv_mode(fd, bus, interlaced):
+    """The raster as a regular CEA 480i / 240p HDMI source: the chip detects
+    the VIC from the input timing and repeats pixels itself; the AVI frame
+    says 4:3. setup_hdmi's other settings (RGB 444, audio) stay."""
+    vic = 6 if interlaced else 8
+    wr(fd, 0x17, 0x60)                   # syncs as Main's 15 kHz modes, aspect 4:3
+    wr(fd, 0x3B, 0x00)                   # automatic pixel repetition
+    wr(fd, 0x3C, vic)
+    wr(fd, 0x56, 0x18)                   # AVI: picture 4:3, active format = picture
+    wr(fd, 0x40, rd(fd, 0x40) & ~0x40)   # no SPD (the DV1 frame is for DAC adapters)
+    print("ADV7513 (/dev/i2c-%d) set for HDMI TV: VIC %d (%s 4:3)"
+          % (bus, vic, "480i" if interlaced else "240p"))
+
 def main():
     fd, bus = open_adv()
     try:
         if "--probe" in sys.argv:
             probe(fd, bus)
+            return 0
+        if "--tv" in sys.argv:
+            tv_mode(fd, bus, "--240p" not in sys.argv)
             return 0
         for reg, val in REGS:
             wr(fd, reg, val)
