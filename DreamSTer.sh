@@ -490,12 +490,21 @@ CRT_CLOCK_OPT = Option("CRT Clock (r7)", "CrtClockSelR7",
                         ("2", "112.5 MHz")], "100",
                        section="dreamster")
 UNIFIED_100_RBF = os.path.join(MINICAST_DIR, "polly2-rtl-crt-r7mv-unified-100.rbf")
+# HDMI output: "dv" = the 15 kHz raster on HDMI too (direct-video DACs, the
+# CRT builds so far); "1080p" = the CRT_DUAL build (polly2 crt15k-r7-dual):
+# stock 1080p HDMI alongside the 15 kHz analog output, one bitstream for
+# both. 100 MHz CRT clock only (that is the build that exists).
+HDMI_OPT = Option("HDMI output", "CrtHdmi",
+                  [("dv", "15 kHz (direct video)"), ("1080p", "1080p + CRT at once")],
+                  "dv", section="dreamster")
+HDMI_100_RBF = os.path.join(MINICAST_DIR, "polly2-rtl-crt-r7mv-hdmi-100.rbf")
 
 # every option Restore Defaults resets; OPTMODE last so the balanced preset
 # is what ends up in the OPT_ITEMS keys
 ALL_OPTIONS = [REGION_OPT, CABLE_OPT, OVERCLOCK_OPT, TIMEREC_OPT, AUDIO_OPT,
                FPS_OPT, AUTORESET_OPT, CLOCK_OPT, DUMP_OPT,
                CRT_VOL_OPT, VIDEO_OPT, ANALOG_OPT, FIELD_OPT, VFILTER_OPT, WIFI_OPT,
+               HDMI_OPT,
                VMU_OPT, RA_OPT, AUDIO_THREAD_OPT, RA_POPUPS_OPT,
                CRT_CLOCK_OPT,
                CRT_EMU_OPT] + OPT_ITEMS \
@@ -2589,6 +2598,7 @@ def configure_screen(scr, cfg, subtitle, launch=False, game=None):
     rows += [("header", "CRT"),
              ("opt", CRT_VOL_OPT), ("opt", VIDEO_OPT), ("opt", FIELD_OPT),
              ("opt", VFILTER_OPT), ("opt", ANALOG_OPT), ("opt", WIFI_OPT),
+             ("opt", HDMI_OPT),
              ("opt", VMU_OPT), ("opt", RA_OPT), ("opt", AUDIO_THREAD_OPT), ("opt", RA_POPUPS_OPT),
              ("opt", CRT_CLOCK_OPT), ("opt", CRT_EMU_OPT)]
     rows += [("header", "Dreamcast"),
@@ -3870,6 +3880,13 @@ def select_bitstream(cfg):
             rbf = UNIFIED_100_RBF
         else:
             notes.append("100 MHz bitstream missing - it would run at 112.5 MHz")
+        if HDMI_OPT.current(cfg) == "1080p":
+            if os.path.exists(HDMI_100_RBF):
+                rbf = HDMI_100_RBF
+            else:
+                notes.append("1080p + CRT bitstream missing - HDMI stays 15 kHz")
+    elif HDMI_OPT.current(cfg) == "1080p":
+        notes.append("1080p + CRT needs the 100 MHz CRT clock - HDMI stays 15 kHz")
     if not os.path.exists(rbf):
         notes.append("%s bitstream missing, using 240p" % mode)
         mode, rbf = "240p", CRT_BITSTREAMS["240p"]
@@ -4007,8 +4024,11 @@ def launch(game, overclock, cfg=None):
         run(["insmod", MEM_WC], cwd=MINICAST_DIR)
         run([LOAD_BITSTREAM, rbf], cwd=MINICAST_DIR)
         run([SETUP_HDMI], cwd=MINICAST_DIR)
-        run(["python3", HDMI15K] + (["--240p"] if mode.startswith("240p") else []),
-            cwd=MINICAST_DIR)
+        if rbf == HDMI_100_RBF:
+            crt_log("HDMI 1080p alongside the CRT")    # setup_hdmi's 1080p stays
+        else:
+            run(["python3", HDMI15K] + (["--240p"] if mode.startswith("240p") else []),
+                cwd=MINICAST_DIR)
         write_audio_vol(vol.att)
         ctrl = crt_ctrl_value(cfg, mode)
         write_crt_ctrl(ctrl)
